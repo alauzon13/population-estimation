@@ -1,2 +1,6 @@
 Data/
 venv312/
+__pycache__/
+osm_extractor_files_dir/
+*.pbf
+.DS_Store
