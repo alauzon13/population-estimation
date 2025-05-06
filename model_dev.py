@@ -10,7 +10,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, m
 from sklearn.pipeline import Pipeline
 from numpy import arange
 import warnings
-from sklearn.exceptions import UndefinedMetricWarning
+from sklearn.exceptions import ConvergenceWarning, UndefinedMetricWarning
 
 
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
@@ -28,22 +28,26 @@ def prepare_data(gdf, cols_to_remove, crs = "EPSG:4326"):
     # A. Project to new CRS
     gdf_proj = gdf.to_crs(crs)
 
-    # B. Convert area unit from m to km
-    gdf_proj["area_km_sq"]=gdf_proj.area/10**6
-    areas = gdf_proj["area_km_sq"]
+    # B. Remove Yukon
+    gdf_no_yukon = gdf_proj[gdf_proj["Subdivision"]!="Yukon"].copy()
+    subdivisions = gdf_no_yukon["Subdivision"]
 
-    # C. Drop columns
-    gdf_reduced = gdf_proj.drop(columns=cols_to_remove) 
+    # C. Convert area unit from m to km
+    gdf_no_yukon["area_km_sq"]=gdf_no_yukon.area/10**6
+    areas = gdf_no_yukon["area_km_sq"]
 
-    # D. Find normalization. NOTE: This makes our response pop density, not pop count. 
+    # D. Drop columns
+    gdf_reduced = gdf_no_yukon.drop(columns=cols_to_remove) 
+
+    # E. Find normalization. NOTE: This makes our response pop density, not pop count. 
     gdf_norm = gdf_reduced.apply(lambda row: row / row["area_km_sq"], axis=1)
     gdf_norm["population_density"] = gdf_norm["population"]
 
-    # E. Remove area
+    # F. Remove area
     gdf_reduced = gdf_norm.drop(columns=["area_km_sq", "population"])
     
 
-    return(gdf_reduced, areas)
+    return(gdf_reduced, areas, subdivisions)
 
 
 # Function where I can build the regressors 
@@ -72,27 +76,56 @@ def compare_models(regressors, gdf, degrees=[1, 2]):
                 ("regressor", model)
             ])
 
-            if name in ['LinearRegression', 'RandomForest', 'GradientBoosting']:
-                # Use cross_val_predict for models that don't support built-in CV
-                y_pred = cross_val_predict(pipeline, X, y, cv=loo)
-            else:
-                pipeline.fit(X, y)
-                y_pred = pipeline.predict(X)
+            # Track convergence and warnings
+            converged = True
+            warning_raised = None
+            best_params = None
+            try:
+                if name in ['LinearRegression', 'RandomForest', 'GradientBoosting']:
+                    # Use cross_val_predict for models that don't support built-in CV
+                    y_pred = cross_val_predict(pipeline, X, y, cv=loo)
+                else:
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("error", category=ConvergenceWarning)  # Treat ConvergenceWarning as an error
+                        warnings.filterwarnings("error", category=UndefinedMetricWarning)  # Treat UndefinedMetricWarning as an error
+                        warnings.filterwarnings("error", category=UserWarning)  # Treat UserWarning as an error
+                        pipeline.fit(X, y)
+                        y_pred = pipeline.predict(X)
 
+                    # Extract best hyperparameters for models that support it
+                    if hasattr(model, "alpha_"):  # For RidgeCV, LassoCV, ElasticNetCV
+                        best_params = f"alpha={model.alpha_}"
+                    if hasattr(model, "l1_ratio_"):  # For ElasticNetCV
+                        best_params += f", l1_ratio={model.l1_ratio_}"
+
+            except ConvergenceWarning:
+                converged = False
+                warning_raised = "ConvergenceWarning"
+                y_pred = [0] * len(y)  # Set predictions to 0 if the model fails to converge
+            except UndefinedMetricWarning:
+                converged = False
+                warning_raised = "UndefinedMetricWarning"
+                y_pred = [0] * len(y)  # Handle undefined metrics gracefully
+            except UserWarning:
+                converged = False
+                warning_raised = "UserWarning"
+                y_pred = [0] * len(y)  # Handle user warnings gracefully
+
+            # Calculate metrics
             mae = mean_absolute_error(y, y_pred)
             mse = mean_squared_error(y, y_pred)
-            new_row = [name, degree, mae, mse]
+            new_row = [name, degree, mae, mse, converged, warning_raised, best_params]
             data.append(new_row)
     
-    df_to_return = pd.DataFrame(data, columns=["Regressor", "Polynomial Degree", "MAE", "MSE"]).sort_values(by="MAE", ascending=True)
-    print(df_to_return.round(2))
-
-
+    # Create DataFrame with results
+    df_to_return = pd.DataFrame(data, columns=["Regressor", "Polynomial Degree", "MAE", "MSE", "Converged", "Warning", "Best Params"]).sort_values(by="MAE", ascending=True)
+    return df_to_return
 
 
 
 if __name__ == "__main__":
     gdf = gpd.read_file("Data/osm_extractor_output")
+
     cols_to_remove = ["geo_point_2d",
                     "year",
                     "prov_code",
@@ -109,7 +142,7 @@ if __name__ == "__main__":
                     "Subdivision",
                     "updated",
                     "geometry"]
-    gdf_norm, areas = prepare_data(gdf, cols_to_remove, crs='epsg:3857')
+    gdf_norm, areas, subdivisions = prepare_data(gdf, cols_to_remove, crs='epsg:3857')
 
         # Leave-One-Out CV
     loo = LeaveOneOut()
@@ -127,7 +160,8 @@ if __name__ == "__main__":
                                                       max_depth=3, random_state=42)
     }
 
-    compare_models(regressors, gdf_norm, degrees=[1, 2])
+    performance = compare_models(regressors, gdf_norm, degrees=[1, 2])
+    print(performance)
 
 
         
