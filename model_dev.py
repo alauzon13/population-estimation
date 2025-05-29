@@ -2,15 +2,18 @@
 import pandas as pd
 import numpy as np 
 import geopandas as gpd
-from sklearn.linear_model import RidgeCV, LassoCV, ElasticNetCV, LinearRegression
+from sklearn.linear_model import ElasticNet, Lasso, Ridge, RidgeCV, LassoCV, ElasticNetCV, LinearRegression
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.preprocessing import StandardScaler,PolynomialFeatures, scale
-from sklearn.model_selection import LeaveOneOut, train_test_split, cross_val_score, RepeatedKFold, cross_val_predict
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, make_scorer
+from sklearn.preprocessing import StandardScaler,PolynomialFeatures
+from sklearn.model_selection import LeaveOneOut, cross_val_predict, GridSearchCV, cross_val_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.pipeline import Pipeline
-from numpy import arange
 import warnings
 from sklearn.exceptions import ConvergenceWarning, UndefinedMetricWarning
+from sklearn.base import clone
+import joblib  # For saving the model
+
+
 
 
 warnings.filterwarnings("ignore", category=UndefinedMetricWarning)
@@ -26,31 +29,216 @@ def prepare_data(gdf, cols_to_remove, crs = "EPSG:4326"):
     """
 
     # A. Project to new CRS
-    gdf_proj = gdf.to_crs(crs)
+    gdf_final = gdf.to_crs(crs)
 
-    # B. Remove Yukon
-    gdf_no_yukon = gdf_proj[gdf_proj["Subdivision"]!="Yukon"].copy()
-    subdivisions = gdf_no_yukon["Subdivision"]
+    # # B. Remove Yukon
+    # gdf_no_yukon = gdf_proj[gdf_proj["Subdivision"]!="Yukon"].copy()
+    subdivisions = gdf_final["csd_name_en"]
+    provinces  = gdf_final["Province"]
 
     # C. Convert area unit from m to km
-    gdf_no_yukon["area_km_sq"]=gdf_no_yukon.area/10**6
-    areas = gdf_no_yukon["area_km_sq"]
+    gdf_final["area_km_sq"]=gdf_final.area/10**6
+    areas = gdf_final["area_km_sq"]
 
     # D. Drop columns
-    gdf_reduced = gdf_no_yukon.drop(columns=cols_to_remove) 
+    gdf_final = gdf_final.drop(columns=cols_to_remove) 
 
     # E. Find normalization. NOTE: This makes our response pop density, not pop count. 
-    gdf_norm = gdf_reduced.apply(lambda row: row / row["area_km_sq"], axis=1)
-    gdf_norm["population_density"] = gdf_norm["population"]
+    gdf_final = gdf_final.apply(lambda row: row / row["area_km_sq"], axis=1)
+    gdf_final["population_density"] = gdf_final["population"]
 
     # F. Remove area
-    gdf_reduced = gdf_norm.drop(columns=["area_km_sq", "population"])
+    gdf_final = gdf_final.drop(columns=["area_km_sq", "population"])
+    
+    gdf_final["Province"] = provinces
+
+    gdf_final = gdf_final.dropna()
+
+    return(gdf_final, areas, subdivisions)
+
+import warnings
+from sklearn.exceptions import ConvergenceWarning
+
+import warnings
+from sklearn.exceptions import ConvergenceWarning
+
+def compare_models_logo_warnings(regressors, gdf, degrees=[1, 2], cv_strategy=None,  save_path="best_model.pkl"):
+    """
+    Compares different models using MAE and optionally includes polynomial features.
+
+    Parameters:
+        regressors: dict of regressors
+        gdf: GeoDataFrame with features and target
+        degrees: list of polynomial degrees to try (default=[1, 2])
+        cv_strategy: cross-validation object (e.g., LeaveOneGroupOut or custom spatial CV)
+
+    Returns:
+        best_model: The best-performing model (fitted on the training data)
+        best_params: Parameters of the best model
+        results: DataFrame with performance metrics and warnings for all models
+    """
+
+    # Prepare target and features
+    y = gdf["population_density"]
+    X = gdf.drop(columns=["population_density", "Province"])  # Drop Province directly
+
+    # Extract groups if the cross-validation strategy requires it
+    groups = gdf["Province"] if hasattr(cv_strategy, 'split') and 'groups' in cv_strategy.split.__code__.co_varnames else None
+
+    # Initialize variables to track the best model
+    best_model = None
+    best_params = None
+    best_mae = float("inf")
+    results = []
+
+    for degree in degrees:
+        # Precompute polynomial features
+        poly = PolynomialFeatures(degree=degree, include_bias=False)
+        X_poly = poly.fit_transform(X)
+
+        for name, model in regressors.items():
+            warning_raised = None  # Initialize warning tracker
+            try:
+                pipeline = Pipeline([
+                    ("scaler", StandardScaler()),
+                    ("model", clone(model))
+                ])
+
+                # Suppress warnings during cross-validation
+                with warnings.catch_warnings(record=True) as w:
+                    warnings.simplefilter("always")  # Capture all warnings
+                    scores = cross_val_score(
+                        pipeline, X_poly, y, cv=cv_strategy,
+                        scoring='neg_mean_absolute_error', groups=groups, n_jobs=1
+                    )
+
+                    # Check if any warnings were raised
+                    if len(w) > 0:
+                        warning_raised = "; ".join([str(warning.message) for warning in w])
+
+                # Calculate mean MAE
+                mae = -np.mean(scores)
+
+                # Optionally fit on all data for consistent prediction
+                pipeline.fit(X_poly, y)
+                current_params = {"model": name, "degree": degree}
+
+                # Save results
+                results.append({
+                    "Model": name,
+                    "Degree": degree,
+                    "MAE": mae,
+                    "Warning": warning_raised  # Store warnings in the results
+                })
+
+                # Debug output
+                print(f"Evaluated {name} with degree {degree} => MAE: {mae} (current best: {best_mae})")
+
+                # Update the best model if this one is better
+                if np.isfinite(mae) and mae < best_mae:
+                    print(f"  → Updating best model to {name} (degree {degree}) with MAE {mae}")
+                    best_mae = mae
+                    best_model = pipeline
+                    best_params = current_params
+
+                    # Save the best model to a file
+                    joblib.dump(best_model, save_path)
+                    print(f"Best model saved to {save_path}")
+
+
+            except Exception as e:
+                warning_raised = str(e)  # Store exception as a warning
+                print(f"Model {name} with degree {degree} failed: {e}")
+                results.append({
+                    "Model": name,
+                    "Degree": degree,
+                    "MAE": np.nan,
+                    "Warning": warning_raised
+                })
+
+    # Convert results to a DataFrame
+    results_df = pd.DataFrame(results)
+    print("Best Model:", best_params)
+    print("Lowest MAE in results_df:", results_df["MAE"].min())
+    return best_model, best_params, results_df
+
+def compare_models_logo(regressors, gdf, degrees=[1, 2], cv_strategy=None):
     
 
-    return(gdf_reduced, areas, subdivisions)
+    y = gdf["population_density"]
+    X = gdf.drop(columns=["population_density", "Province"])
 
+    groups = gdf["Province"] if hasattr(cv_strategy, 'split') and 'groups' in cv_strategy.split.__code__.co_varnames else None
 
-# Function where I can build the regressors 
+    best_model = None
+    best_params = None
+    best_mae = float("inf")
+    results = []
+
+    for degree in degrees:
+        poly = PolynomialFeatures(degree=degree, include_bias=False)
+        X_poly = poly.fit_transform(X)
+
+        for name, model in regressors.items():
+            try:
+                if name in ['RidgeCV', 'LassoCV', 'ElasticNetCV']:
+                    param_grid = {}
+                    if name == 'RidgeCV':
+                        base_model = Ridge()
+                        param_grid = {'alpha': model.alphas}
+                    elif name == 'LassoCV':
+                        base_model = Lasso(max_iter=model.max_iter)
+                        param_grid = {'alpha': model.alphas}
+                    elif name == 'ElasticNetCV':
+                        base_model = ElasticNet(max_iter=model.max_iter)
+                        param_grid = {'alpha': model.alphas, 'l1_ratio': model.l1_ratio}
+
+                    grid = GridSearchCV(
+                        base_model, param_grid, cv=cv_strategy,
+                        scoring='neg_mean_absolute_error', n_jobs=-1
+                    )
+                    grid.fit(X_poly, y, groups=groups)
+
+                    mae = -grid.best_score_
+                    best_pipeline = grid.best_estimator_
+                    current_params = {"model": name, "degree": degree, **grid.best_params_}
+
+                else:
+                    pipeline = Pipeline([
+                        ("scaler", StandardScaler()),
+                        ("model", clone(model))
+                    ])
+                    scores = cross_val_score(
+                        pipeline, X_poly, y, cv=cv_strategy,
+                        scoring='neg_mean_absolute_error', groups=groups, n_jobs=-1
+                    )
+                    mae = -np.mean(scores)
+                    pipeline.fit(X_poly, y)
+                    best_pipeline = pipeline
+                    current_params = {"model": name, "degree": degree}
+
+                results.append({
+                    "Model": name,
+                    "Degree": degree,
+                    "MAE": mae
+                })
+
+                # Debug output
+                print(f"Evaluated {name} with degree {degree} => MAE: {mae} (current best: {best_mae})")
+
+                if np.isfinite(mae) and mae < best_mae:
+                    print(f"  → Updating best model to {name} (degree {degree}) with MAE {mae}")
+                    best_mae = mae
+                    best_model = best_pipeline
+                    best_params = current_params
+
+            except Exception as e:
+                print(f"Model {name} with degree {degree} failed: {e}")
+
+    results_df = pd.DataFrame(results)
+    print("Best Model:", best_params)
+    print("Lowest MAE in results_df:", results_df["MAE"].min())
+    return best_model, best_params, results_df
 
 def compare_models(regressors, gdf, degrees=[1, 2]):
     """
